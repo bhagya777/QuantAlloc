@@ -75,7 +75,7 @@ QuantAlloc/
 ├── README.md              # Project documentation
 ├── assets/                # Images and static assets
 └── .gitignore             # Files to ignore (e.g., venv, pycache)
-
+```
 ---
 
 ## ⚠️ Constraints & Future Roadmap
