@@ -6,18 +6,16 @@ import datetime as dt
 import plotly.express as px
 import plotly.graph_objects as go
 from pypfopt import expected_returns, risk_models, HRPOpt, DiscreteAllocation, get_latest_prices, EfficientFrontier , objective_functions
-# ==========================================
-# 1. PAGE CONFIGURATION
-# ==========================================
+
+# PAGE CONFIGURATION
 st.set_page_config(
     page_title="QuantAlloc: AI Portfolio Optimizer",
     page_icon="🧠",
     layout="wide"
 )
 
-# ==========================================
-# 1.1 BLOOMBERG THEME STYLING
-# ==========================================
+
+# BLACK THEME STYLING
 st.markdown("""
     <style>
     /* Main Background - Pitch Black */
@@ -31,7 +29,7 @@ st.markdown("""
         background-color: #121212;
     }
 
-    /* FORCE SIDEBAR TEXT COLOR (Labels, Text, Paragraphs) */
+    /* SIDEBAR TEXT COLOR (Labels, Text, Paragraphs) */
     section[data-testid="stSidebar"] label, 
     section[data-testid="stSidebar"] p,
     section[data-testid="stSidebar"] div[data-testid="stMarkdown"] {
@@ -76,6 +74,7 @@ st.markdown("""
     div[data-testid="stDataFrame"] {
         background-color: #121212;
     }
+    
     /* CUSTOM STRATEGY BOXES */
     .bloomberg-box-blue {
         background-color: #001a33; /* Dark Navy */
@@ -100,10 +99,8 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# ==========================================
-# 2. HELPER FUNCTIONS (Cached)
-# ==========================================
 
+# 2. HELPER FUNCTIONS (Cached)
 @st.cache_data(ttl=86400)  # Cache for 24 hours
 def get_sp500_tickers():
     """Scrapes the S&P 500 tickers from Wikipedia"""
@@ -112,7 +109,6 @@ def get_sp500_tickers():
     fallback_tickers = [
         "AAPL", "MSFT", "GOOGL"
     ]
-
     try:
         df = pd.read_csv(url)
         tickers = df['Symbol'].tolist()
@@ -134,25 +130,24 @@ def fetch_data(tickers, start, end):
         req_tickers.append("SPY")
 
     try:
-        # Download data
         data = yf.download(req_tickers, start=start, end=end, progress=False)
 
-        # 1. Handle 'Adj Close' vs 'Close' preference
+        # to handle 'Adj Close' vs 'Close' preference
         if 'Adj Close' in data.columns:
             prices = data['Adj Close']
         elif 'Close' in data.columns:
             prices = data['Close']
         else:
-            # Fallback if structure is weird (e.g. single ticker flattened)
+            # fallback if structure is weird (e.g. single ticker flattened)
             prices = data
 
-        # 2. Ensure it's a DataFrame, not a Series (happens if only 1 ticker downloaded)
+        # to ensure it's a DataFrame, not a Series (happens if only 1 ticker downloaded)
         if isinstance(prices, pd.Series):
             prices = prices.to_frame()
             prices.columns = req_tickers  # Rename column to ticker name
 
-        # 3. Clean Data
-        # Forward fill missing values (hold previous price), then drop remaining NaNs
+        # Clean Data
+        # to orward fill missing values (hold previous price), then drop remaining NaNs
         prices = prices.ffill().dropna()
 
         return prices
@@ -161,62 +156,77 @@ def fetch_data(tickers, start, end):
         return pd.DataFrame()
 
 
-def run_optimization(prices):
-    """Runs BOTH HRP and Mean-Variance Optimization (Max Sharpe)"""
+@st.cache_data(ttl=86400)
+def get_risk_free_rate(start_date, end_date):
+    """
+    Fetches the period Treasury Yield (^TNX) and calculates the AVERAGE yield
+    over the selected time period.
+    """
+    try:
+        treasury = yf.download("^TNX", start=start_date, end=end_date, progress=False)
+        if not treasury.empty:
+            if 'Adj Close' in treasury.columns:
+                yields = treasury['Adj Close']
+            else:
+                yields = treasury['Close']
+            avg_yield = yields.mean()
+            # to convert to scalar float and then to decimal
+            if isinstance(avg_yield, (int, float, np.number)):
+                return float(avg_yield) / 100.0
+            return float(avg_yield.item()) / 100.0
+    except Exception:
+        pass
+    return 0.04  # fallback to 4% if fetch fails
 
+def run_optimization(prices, rf_rate):
+    """Runs BOTH HRP and Mean-Variance Optimization (Max Sharpe)"""
     prices_cleaned = prices.ffill()
     returns = prices_cleaned.pct_change().dropna()
-
     valid_assets = returns.columns[returns.std() > 1e-6]
     if len(valid_assets) < 2:
         raise ValueError("Not enough valid assets (need > 0 variance).")
-
     returns = returns[valid_assets]
     prices_cleaned = prices_cleaned[valid_assets]
 
-    # Strategy 1: HRP (Machine Learning)
+    # Strategy 1: HRP
     hrp = HRPOpt(returns=returns)
     hrp_weights = hrp.optimize()
-    hrp_perf = hrp.portfolio_performance(verbose=False)
+    hrp_perf = hrp.portfolio_performance(verbose=False, risk_free_rate=rf_rate)
 
-    # Strategy 2: MVO (Max Sharpe)
+    # Strategy 2: MVO
     mu = expected_returns.mean_historical_return(prices_cleaned)
     S = risk_models.sample_cov(prices_cleaned)
     ef = EfficientFrontier(mu, S)
-    # Add L2 regularization to prevent weights going to 100% on one asset (overfitting)
-    # FIX: Use built-in objective function to avoid numpy/cvxpy version conflicts
+    # Adding L2 regularization to prevent weights going to 100% on one asset (overfitting)
+    # Using built-in objective function to avoid numpy/cvxpy version conflicts
     ef.add_objective(objective_functions.L2_reg, gamma=0.1)
-
     try:
-        mvo_weights = ef.max_sharpe()
+        mvo_weights = ef.max_sharpe(risk_free_rate=rf_rate)
     except:
         # Fallback if Max Sharpe fails (e.g., negative returns) -> Min Volatility
         mvo_weights = ef.min_volatility()
-
-    mvo_perf = ef.portfolio_performance(verbose=False)
+    mvo_perf = ef.portfolio_performance(verbose=False,risk_free_rate=rf_rate)
     return hrp_weights, hrp_perf, mvo_weights, mvo_perf, returns
 
-# ==========================================
-# 3. SIDEBAR INPUTS
-# ==========================================
+
+# SIDEBAR INPUTS
 st.sidebar.header("⚙️ Strategy Settings")
 
-# --- Ticker Selector ---
+# Ticker Selector
 with st.sidebar:
     with st.spinner("Loading Tickers..."):
         available_tickers = get_sp500_tickers()
-
 desired_defaults = ["AAPL", "MSFT", "AMZN", "GOOGL"]
 valid_defaults = [t for t in desired_defaults if t in available_tickers]
 if not valid_defaults:
     valid_defaults = available_tickers[:5]
-
+#dropbox
 selected_tickers = st.sidebar.multiselect(
     "Select Assets (S&P 500)",
     options=available_tickers,
     default=valid_defaults
 )
-
+#custom add input list
 custom_ticker_input = st.sidebar.text_input("➕ Add Custom Ticker (e.g. BTC-USD)", value="")
 if custom_ticker_input:
     custom_tickers = [t.strip().upper() for t in custom_ticker_input.split(",") if t.strip()]
@@ -224,26 +234,31 @@ if custom_ticker_input:
     selected_tickers = list(set(selected_tickers))
 st.sidebar.caption(f"Selected: {len(selected_tickers)} assets")
 
-# --- NEW: Strategy Selector ---
+# Strategy Selector
 strategy_mode = st.sidebar.selectbox(
     "Select Optimization Strategy",
     options=["Compare Both (Recommended)", "Hierarchical Risk Parity (HRP)", "Max Sharpe (MVO)"],
     index=0
 )
 
+#investment amount input
 investment_amount = st.sidebar.number_input("Investment Capital ($)", min_value=1000, value=10000, step=500)
 
+# dates inputs
 col1, col2 = st.sidebar.columns(2)
 with col1:
     start_date = st.date_input("Start Date", value=dt.date(2018, 1, 1))
 with col2:
     end_date = st.date_input("End Date", value=dt.date.today())
 
+# to calculate Average Risk Free Rate based on inputs
+rf_rate = get_risk_free_rate(start_date, end_date)
+st.sidebar.markdown(f"**Avg Risk-Free Rate:** `{rf_rate:.2%}`")
+
 run_btn = st.sidebar.button("🚀 Build Portfolio", type="primary")
 
-# ==========================================
-# 4. MAIN DASHBOARD LOGIC
-# ==========================================
+
+# MAIN DASHBOARD LOGIC
 st.title("🧠 QuantAlloc: ML-Driven Portfolio Optimization")
 
 if run_btn:
@@ -252,13 +267,10 @@ if run_btn:
     else:
         with st.spinner("Fetching market data & running simulations..."):
             try:
-                # FETCH DATA
                 raw_data = fetch_data(selected_tickers, start_date, end_date)
-
                 if raw_data.empty:
                     st.error("No data found.")
                     st.stop()
-
                 if "SPY" in raw_data.columns:
                     spy_data = raw_data["SPY"]
                     user_tickers = [t for t in selected_tickers if t in raw_data.columns and t != "SPY"]
@@ -269,26 +281,20 @@ if run_btn:
                 else:
                     spy_data = None
                     portfolio_data = raw_data
-
-                # OPTIMIZATION
-                hrp_weights, hrp_perf, mvo_weights, mvo_perf, returns = run_optimization(portfolio_data)
-
+                # Optimization
+                hrp_weights, hrp_perf, mvo_weights, mvo_perf, returns = run_optimization(portfolio_data,rf_rate)
                 clean_hrp = hrp_weights
                 clean_mvo = dict(mvo_weights)
                 latest_prices = get_latest_prices(portfolio_data)
-
             except Exception as e:
                 st.error(f"Optimization Failed: {e}")
                 st.stop()
 
-        # ==========================================
-        # 5. RESULTS DISPLAY (CONDITIONAL)
-        # ==========================================
-
+        # RESULTS DISPLAY (CONDITIONAL)
         show_hrp = "HRP" in strategy_mode or "Compare" in strategy_mode
         show_mvo = "MVO" in strategy_mode or "Compare" in strategy_mode
 
-        # A. Metrics Section
+        # Metrics Section
         st.subheader("📊 Performance Metrics")
         col_metrics = st.columns(2) if (show_hrp and show_mvo) else st.columns(1)
 
@@ -319,7 +325,7 @@ if run_btn:
 
         st.divider()
 
-        # B. Allocation Visuals
+        # Allocation Visuals
         st.subheader("🎨 Asset Allocation")
         col_charts = st.columns(2) if (show_hrp and show_mvo) else st.columns(1)
 
@@ -342,28 +348,26 @@ if run_btn:
                     buy_data = [{"Ticker": t, "Shares": s, "Price": f"${latest_prices[t]:.2f}",
                                  "Cost": f"${s * latest_prices[t]:.2f}"} for t, s in allocation.items()]
                     buy_df=pd.DataFrame(buy_data)
-                    # REPLACEMENT: Plotly Table for Full Color Control
-                    # Dynamic Height Calculation to remove gap
+
+                    # Dynamic Height Calculation to remove gap betn table and cash remain
                     row_height = 30
                     header_height = 40
                     num_rows = len(buy_df)
-                    table_height = header_height + (num_rows * row_height) + 10  # small buffer
-
+                    table_height = header_height + (num_rows * row_height) + 10
                     fig_table = go.Figure(data=[go.Table(
                         header=dict(values=list(buy_df.columns),
-                                    fill_color='#ff9900',  # Bloomberg Orange Header
+                                    fill_color='#ff9900',
                                     font=dict(color='black', size=14, family="Courier New"),
                                     align='center'),
                         cells=dict(values=[buy_df[k].tolist() for k in buy_df.columns],
-                                   fill_color='#121212',  # Dark Grey Cells
+                                   fill_color='#121212',
                                    font=dict(color='#ff9900', size=12, family="Courier New"),  # Orange text
                                    align='center',
                                    height=row_height))
                     ])
-
                     fig_table.update_layout(
                         margin=dict(l=0, r=0, t=0, b=0),
-                        height=table_height,  # Dynamic Height
+                        height=table_height,
                         paper_bgcolor="rgba(0,0,0,0)",
                         plot_bgcolor="rgba(0,0,0,0)"
                     )
@@ -390,39 +394,39 @@ if run_btn:
                     buy_data = [{"Ticker": t, "Shares": s, "Price": f"${latest_prices[t]:.2f}",
                                  "Cost": f"${s * latest_prices[t]:.2f}"} for t, s in allocation.items()]
                     buy_df=pd.DataFrame(buy_data)
-                    # REPLACEMENT: Plotly Table for Full Color Control
-                    # Dynamic Height Calculation to remove gap
+
+                    # Dynamic Height Calculation to remove gap betn table and cash remain
                     row_height = 30
                     header_height = 40
                     num_rows = len(buy_df)
-                    table_height = header_height + (num_rows * row_height) + 10  # small buffer
+                    table_height = header_height + (num_rows * row_height) + 10
 
                     fig_table = go.Figure(data=[go.Table(
                         header=dict(values=list(buy_df.columns),
-                                    fill_color='#ff9900',  # Bloomberg Orange Header
+                                    fill_color='#ff9900',
                                     font=dict(color='black', size=14, family="Courier New"),
                                     align='center'),
                         cells=dict(values=[buy_df[k].tolist() for k in buy_df.columns],
-                                   fill_color='#121212',  # Dark Grey Cells
-                                   font=dict(color='#ff9900', size=12, family="Courier New"),  # Orange text
+                                   fill_color='#121212',
+                                   font=dict(color='#ff9900', size=12, family="Courier New"),
                                    align='center',
                                    height=row_height))
                     ])
 
                     fig_table.update_layout(
                         margin=dict(l=0, r=0, t=0, b=0),
-                        height=table_height,  # Dynamic Height
+                        height=table_height,
                         paper_bgcolor="rgba(0,0,0,0)",
                         plot_bgcolor="rgba(0,0,0,0)"
                     )
                     st.plotly_chart(fig_table, use_container_width=True)
                     st.write(f"Cash Remaining: ${leftover:.2f}")
 
-        # C. Efficient Frontier
+        # Efficient Frontier
         st.divider()
         st.subheader("📉 Efficient Frontier Analysis")
 
-        # ... (Monte Carlo simulation logic same as before) ...
+        # Monte Carlo simulation
         with st.spinner("Running Monte Carlo Simulation..."):
             n_samples = 1000
             w = np.random.dirichlet(np.ones(len(portfolio_data.columns)), n_samples)
@@ -455,8 +459,7 @@ if run_btn:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        # D. Backtest (Only show if comparing or specific selected)
-        # ... (Backtest logic mostly same, just wrap add_trace in if show_hrp / if show_mvo) ...
+        # Backtest (Only show if comparing or specific selected)
         st.divider()
         st.subheader("📉 Historical Backtest")
 
@@ -485,7 +488,6 @@ if run_btn:
             fig_perf.add_trace(
                 go.Scatter(x=spy_cum_ret.loc[common_idx].index, y=spy_cum_ret.loc[common_idx] * investment_amount,
                            mode='lines', name='S&P 500', line=dict(color='gray', dash='dash')))
-
             fig_perf.update_layout(
                 title="Portfolio Value Over Time ($)",
                 xaxis_title="Date",
@@ -498,22 +500,19 @@ if run_btn:
                 legend_font_color="#ff9900"
             )
             st.plotly_chart(fig_perf, use_container_width=True)
-            # 7. Final Winner Declaration
+
+            # Final Winner Declaration
             final_hrp = hrp_value.iloc[-1]
             final_mvo = mvo_value.iloc[-1]
             final_spy = spy_value.iloc[-1]
 
-
-            # Sort to find the winner
             results = {"Hierarchical Risk Parity (HRP)": final_hrp, "Max Sharpe (MVO)": final_mvo, "S&P 500": final_spy}
             if (show_hrp and show_mvo):
                 winner = max(results, key=results.get)
                 winnings = results[winner] - investment_amount
-
                 st.success(
                     f"🏆 **Winner:** {winner} with a final value of **\${results[winner]:.2f}** (Profit: \${winnings:.2f})")
-
-                # Add context if HRP lost to MVO but had lower volatility
+                # to add context if HRP lost to MVO but had lower volatility
                 if winner == "Max Sharpe (MVO)" and hrp_perf[1] < mvo_perf[1]:
                     st.info(
                         f"ℹ️ **Note:** MVO had higher returns, but HRP had lower volatility ({hrp_perf[1]:.1%} vs {mvo_perf[1]:.1%}). This makes HRP a safer ride.")
@@ -523,7 +522,7 @@ if run_btn:
                     st.success(f"**Winner:** The HRP strategy beat the market by **\${profit_diff:,.2f}**!")
                 else:
                     st.warning(f"**Result:** The S&P 500 beat HRP strategy by **\${abs(profit_diff):,.2f}**.")
-            else:
+            else:   #only show_MVO
                 if final_mvo > final_spy:
                     profit_diff_m = final_mvo - final_spy
                     st.success(f"**Winner:** The MVO strategy beat the market by **\${profit_diff_m:,.2f}**!")
@@ -531,3 +530,14 @@ if run_btn:
                     st.warning(f"**Result:** The S&P 500 beat MVO strategy by **\${abs(profit_diff_m):,.2f}**.")
         else:
             st.warning("SPY data not available for benchmark comparison.")
+
+# FOOTER
+st.markdown("---")
+st.markdown(
+    f"""
+    <div style='text-align: center; color: #ff9900; font-family: "Courier New", Courier, monospace; font-size: 12px;'>
+        © {dt.datetime.now().year} QuantAlloc | Built by Bhagyashree Yadav | For Educational Purposes | Not Financial Advice
+    </div>
+    """,
+    unsafe_allow_html=True
+)
